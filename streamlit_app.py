@@ -1,6 +1,6 @@
 """
-Streamlit 앱: 이미지 노이즈 제거 시각화 (발표용)
-second_checkpoints에 저장된 베스트 성능 모델을 사용합니다.
+Streamlit 앱: 이미지 노이즈 제거 시각화
+lastcheckpoints에 저장된 모델을 사용합니다.
 """
 import streamlit as st
 import torch
@@ -280,32 +280,6 @@ if 'cnn_result' in st.session_state and 'unet_result' in st.session_state and 'i
     
     with col3:
         st.image(st.session_state['unet_result'], caption="U-Net 결과", use_container_width=True)
-
-# 발표용 팁
-with st.expander("💡 발표용 팁", expanded=False):
-    st.markdown("""
-    ### 발표 시 사용 방법
-    
-    1. **준비사항**
-       - 모델 파일: `second_checkpoints/cnn/best_model.pth`, `second_checkpoints/unet/best_model.pth`
-       - 테스트할 노이즈 이미지 준비
-    
-    2. **실행 순서**
-       - `streamlit run team/streamlit_app.py` 명령어로 앱 실행
-       - 브라우저가 자동으로 열립니다
-       - 이미지를 업로드하고 "노이즈 제거 실행" 버튼 클릭
-    
-    3. **발표 팁**
-       - 큰 화면(프로젝터)에 연결하여 시연
-       - CNN과 U-Net 결과를 나란히 비교하여 차이점 강조
-       - 처리 시간과 모델 성능 지표를 비교하여 설명
-       - 각 모델의 장단점을 시각적으로 보여줄 수 있음
-    
-    4. **네트워크 공유 (선택사항)**
-       - 같은 네트워크의 다른 기기에서 접근하려면:
-       - `streamlit run team/streamlit_app.py --server.address 0.0.0.0`
-       - 실행 후 표시되는 네트워크 주소로 접근 가능
-    """)
 
 # 푸터
 st.markdown("---")
