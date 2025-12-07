@@ -1,0 +1,396 @@
+"""
+U-Net 모델 학습 스크립트 (데이터 증강 버전)
+"""
+import torch
+from torch.utils.data import DataLoader
+from unet_model import UNet, ImageDataset, train_model, evaluate_model
+import argparse
+from pathlib import Path
+import torchvision.transforms as transforms
+
+
+def main():
+    parser = argparse.ArgumentParser(description='U-Net 모델 학습 (데이터 증강 버전)')
+    parser.add_argument('--noisy_dir', type=str, required=True,
+                        help='노이즈 이미지 디렉토리 경로 (또는 정제된 데이터가 있는 폴더)')
+    parser.add_argument('--clean_dir', type=str, default=None,
+                        help='깨끗한 이미지 디렉토리 경로 (None이면 noisy_dir에서 파일명 패턴으로 매칭)')
+    parser.add_argument('--matched_pairs_file', type=str, default=None,
+                        help='매칭된 이미지 쌍 정보가 담긴 JSON 파일 경로 (폴더명 기반 매칭 결과)')
+    parser.add_argument('--auto_match', action='store_true',
+                        help='학습 시 자동으로 폴더명 기반 매칭 수행 (matched_pairs_file 없이 사용 가능)')
+    parser.add_argument('--l1_weight', type=float, default=1.0,
+                        help='L1 Loss 가중치 (default: 1.0)')
+    parser.add_argument('--ssim_weight', type=float, default=1.0,
+                        help='SSIM Loss 가중치 (default: 1.0)')
+    parser.add_argument('--gradient_weight', type=float, default=0.5,
+                        help='Gradient Loss 가중치 (default: 0.5)')
+    parser.add_argument('--batch_size', type=int, default=2,
+                        help='배치 크기 (default: 2, U-Net은 메모리를 많이 사용)')
+    parser.add_argument('--lr', type=float, default=5e-5,
+                        help='학습률 (default: 5e-5)')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='에포크 수 (default: 50)')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/unet',
+                        help='체크포인트 저장 디렉토리 (default: checkpoints/unet)')
+    parser.add_argument('--train_ratio', type=float, default=0.7,
+                        help='학습 데이터 비율 (default: 0.7)')
+    parser.add_argument('--val_ratio', type=float, default=0.15,
+                        help='검증 데이터 비율 (default: 0.15)')
+    parser.add_argument('--test_ratio', type=float, default=0.15,
+                        help='테스트 데이터 비율 (default: 0.15)')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='사용할 디바이스 (cuda/cpu) (default: cuda)')
+    parser.add_argument('--gpu_id', type=int, default=0,
+                        help='사용할 GPU ID (default: 0)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='체크포인트 경로 (학습 재개용, 예: checkpoints/unet/best_model.pth)')
+    
+    args = parser.parse_args()
+    
+    # GPU 설정 및 확인
+    if args.device == 'cuda':
+        if torch.cuda.is_available():
+            device = torch.device(f'cuda:{args.gpu_id}')
+            torch.cuda.set_device(args.gpu_id)
+            print(f'=' * 50)
+            print(f'GPU 사용 가능!')
+            print(f'GPU 장치: {torch.cuda.get_device_name(args.gpu_id)}')
+            print(f'GPU 메모리: {torch.cuda.get_device_properties(args.gpu_id).total_memory / 1024**3:.2f} GB')
+            print(f'CUDA 버전: {torch.version.cuda}')
+            print(f'PyTorch 버전: {torch.__version__}')
+            print(f'=' * 50)
+        else:
+            print('⚠️  경고: CUDA를 사용할 수 없습니다. CPU로 전환합니다.')
+            device = torch.device('cpu')
+    else:
+        device = torch.device('cpu')
+        print(f'CPU 모드로 실행합니다.')
+    
+    print(f'사용 디바이스: {device}')
+    
+    # 데이터 증강 정의
+    print('\n📊 데이터 증강 설정:')
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),  # 좌우 반전 (50% 확률)
+    ])
+    val_transform = None  # Validation은 증강 없이 (원본 그대로)
+    augmentation_factor = 2.0  # RandomHorizontalFlip으로 효과적 데이터 2배
+    print('  ✅ Train: RandomHorizontalFlip 적용 (50% 확률)')
+    print('  ✅ Val: 증강 없음 (원본 그대로)')
+    print(f'  📈 증강 효과: 효과적 데이터량 = 실제 데이터량 × {augmentation_factor:.1f}')
+    
+    # 데이터셋 생성
+    print('\n' + '=' * 60)
+    print('데이터셋 로딩 중...')
+    print('=' * 60)
+    if args.matched_pairs_file is not None:
+        print(f'매칭 파일 모드: {args.matched_pairs_file}에서 매칭 정보를 읽습니다.')
+        print(f'  noisy_dir={args.noisy_dir}, clean_dir={args.clean_dir}')
+    elif args.clean_dir is None:
+        print(f'단일 폴더 모드: {args.noisy_dir}에서 파일명 패턴으로 매칭합니다.')
+    else:
+        print(f'이중 폴더 모드: noisy_dir={args.noisy_dir}, clean_dir={args.clean_dir}')
+    
+    # train/val/test 폴더 구조 자동 감지
+    def has_split_structure(base_dir):
+        """폴더에 train/val/test 구조가 있는지 확인"""
+        base_path = Path(base_dir)
+        train_exists = (base_path / 'train').exists()
+        val_exists = (base_path / 'val').exists()
+        test_exists = (base_path / 'test').exists()
+        return train_exists and val_exists and test_exists
+    
+    # 노이즈 데이터의 train/val/test 구조를 존중하는 모드
+    # auto_match 모드이거나 폴더 구조가 있으면 split 구조 사용
+    use_split_structure = (args.auto_match and args.clean_dir is not None) or \
+                          (has_split_structure(args.noisy_dir) and (args.clean_dir is None or has_split_structure(args.clean_dir)))
+    
+    if use_split_structure:
+        # 노이즈 데이터의 train/val/test 구조를 그대로 사용
+        if args.auto_match and args.clean_dir is not None:
+            print("\n노이즈 데이터의 train/val/test 구조를 그대로 사용합니다.")
+            print("Train과 Validation 모두 노이즈 데이터 기준으로 매칭합니다.")
+            
+            # 먼저 증강 없이 데이터셋 생성 (원본 데이터량 확인용)
+            print("\n[1단계] 원본 데이터 매칭 중...")
+            train_dataset_raw = ImageDataset(
+                args.noisy_dir, args.clean_dir,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=True,
+                split='train',
+                reverse_match=False,
+                transform=None  # 증강 없이 먼저 확인
+            )
+            
+            val_dataset_raw = ImageDataset(
+                args.noisy_dir, args.clean_dir,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=True,
+                split='val',
+                reverse_match=False,
+                transform=None  # 증강 없이 먼저 확인
+            )
+            
+            train_raw_count = len(train_dataset_raw)
+            val_raw_count = len(val_dataset_raw)
+            total_raw_count = train_raw_count + val_raw_count
+            
+            print(f"\n📊 원본 데이터 통계 (증강 전):")
+            print(f"   Train: {train_raw_count:,}개 쌍")
+            print(f"   Val:   {val_raw_count:,}개 쌍")
+            print(f"   Total: {total_raw_count:,}개 쌍")
+            
+            # Train과 Val 데이터를 합쳐서 비율에 맞게 재분할
+            # 목표: train:val:test = 7:1.5:1.5
+            target_train_ratio = 7.0 / 10.0  # 7 / (7 + 1.5 + 1.5)
+            target_val_ratio = 1.5 / 10.0
+            target_test_ratio = 1.5 / 10.0
+            
+            target_train_size = int(total_raw_count * target_train_ratio)
+            target_val_size = int(total_raw_count * target_val_ratio)
+            target_test_size = total_raw_count - target_train_size - target_val_size
+            
+            print(f"\n📊 데이터 분할 조정:")
+            print(f"   목표 비율: Train:Val:Test = 7:1.5:1.5")
+            print(f"   목표: Train={target_train_size:,}, Val={target_val_size:,}, Test={target_test_size:,}")
+            
+            # 전체 데이터셋을 합쳐서 재분할
+            from torch.utils.data import ConcatDataset
+            full_dataset_raw = ConcatDataset([train_dataset_raw, val_dataset_raw])
+            
+            # 비율에 맞게 분할
+            train_dataset_split, val_dataset_split, _ = torch.utils.data.random_split(
+                full_dataset_raw, 
+                [target_train_size, target_val_size, target_test_size],
+                generator=torch.Generator().manual_seed(42)  # 재현성을 위해 시드 고정
+            )
+            
+            print(f"   조정 후: Train={len(train_dataset_split):,}, Val={len(val_dataset_split):,}")
+            
+            # [2단계] 증강 적용된 데이터셋 생성
+            print("\n[2단계] 데이터 증강 적용 중...")
+            # 증강을 적용하려면 원본 데이터셋을 다시 생성해야 함
+            # 하지만 random_split으로 분할된 데이터셋에는 transform을 직접 적용할 수 없으므로
+            # 원본 데이터셋에 transform을 적용한 후 다시 분할해야 함
+            
+            # 원본 데이터셋을 증강과 함께 다시 생성
+            train_dataset_with_aug = ImageDataset(
+                args.noisy_dir, args.clean_dir,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=True,
+                split='train',
+                reverse_match=False,
+                transform=train_transform  # 데이터 증강 적용
+            )
+            
+            val_dataset_with_aug = ImageDataset(
+                args.noisy_dir, args.clean_dir,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=True,
+                split='val',
+                reverse_match=False,
+                transform=val_transform  # 증강 없음
+            )
+            
+            # 다시 합쳐서 분할
+            full_dataset_with_aug = ConcatDataset([train_dataset_with_aug, val_dataset_with_aug])
+            train_dataset, val_dataset, _ = torch.utils.data.random_split(
+                full_dataset_with_aug,
+                [target_train_size, target_val_size, target_test_size],
+                generator=torch.Generator().manual_seed(42)
+            )
+            
+            train_final_count = len(train_dataset)
+            val_final_count = len(val_dataset)
+            train_effective_count = int(train_final_count * augmentation_factor)
+            
+            print(f"\n📊 최종 데이터 통계 (증강 적용 후):")
+            print(f"   Train:")
+            print(f"     - 실제 데이터량: {train_final_count:,}개 쌍")
+            print(f"     - 효과적 데이터량: ~{train_effective_count:,}개 쌍 (증강 ×{augmentation_factor:.1f})")
+            print(f"   Val:")
+            print(f"     - 실제 데이터량: {val_final_count:,}개 쌍 (증강 없음)")
+            print(f"   Total: {train_final_count + val_final_count:,}개 쌍")
+            print(f"\n💡 참고: Train 데이터는 매 epoch마다 랜덤하게 변형되어")
+            print(f"   효과적으로 {train_effective_count:,}개의 서로 다른 이미지를 학습합니다.")
+            # test 데이터는 inference 코드에서만 사용
+        else:
+            # 폴더 구조 자동 감지 모드
+            print("\ntrain/val/test 폴더 구조를 자동으로 감지하여 사용합니다.")
+            
+            # 먼저 증강 없이 데이터셋 생성 (원본 데이터량 확인용)
+            print("\n[1단계] 원본 데이터 매칭 중...")
+            train_dataset_raw = ImageDataset(
+                str(Path(args.noisy_dir) / 'train'), 
+                str(Path(args.clean_dir) / 'train') if args.clean_dir else None,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=False,
+                transform=None  # 증강 없이 먼저 확인
+            )
+            val_dataset_raw = ImageDataset(
+                str(Path(args.noisy_dir) / 'val'),
+                str(Path(args.clean_dir) / 'val') if args.clean_dir else None,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=False,
+                transform=None  # 증강 없이 먼저 확인
+            )
+            
+            train_raw_count = len(train_dataset_raw)
+            val_raw_count = len(val_dataset_raw)
+            
+            print(f"\n📊 원본 데이터 통계 (증강 전):")
+            print(f"   Train: {train_raw_count:,}개 쌍")
+            print(f"   Val:   {val_raw_count:,}개 쌍")
+            print(f"   Total: {train_raw_count + val_raw_count:,}개 쌍")
+            
+            # [2단계] 증강 적용된 데이터셋 생성
+            print("\n[2단계] 데이터 증강 적용 중...")
+            train_dataset = ImageDataset(
+                str(Path(args.noisy_dir) / 'train'), 
+                str(Path(args.clean_dir) / 'train') if args.clean_dir else None,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=False,
+                transform=train_transform  # 데이터 증강 추가
+            )
+            val_dataset = ImageDataset(
+                str(Path(args.noisy_dir) / 'val'),
+                str(Path(args.clean_dir) / 'val') if args.clean_dir else None,
+                matched_pairs_file=args.matched_pairs_file,
+                auto_match=False,
+                transform=val_transform  # 증강 없음
+            )
+            
+            train_final_count = len(train_dataset)
+            val_final_count = len(val_dataset)
+            train_effective_count = int(train_final_count * augmentation_factor)
+            
+            print(f"\n📊 최종 데이터 통계 (증강 적용 후):")
+            print(f"   Train:")
+            print(f"     - 실제 데이터량: {train_final_count:,}개 쌍")
+            print(f"     - 효과적 데이터량: ~{train_effective_count:,}개 쌍 (증강 ×{augmentation_factor:.1f})")
+            print(f"   Val:")
+            print(f"     - 실제 데이터량: {val_final_count:,}개 쌍 (증강 없음)")
+            print(f"   Total: {train_final_count + val_final_count:,}개 쌍")
+            print(f"\n💡 참고: Train 데이터는 매 epoch마다 랜덤하게 변형되어")
+            print(f"   효과적으로 {train_effective_count:,}개의 서로 다른 이미지를 학습합니다.")
+            # test 데이터는 inference 코드에서만 사용
+    else:
+        # 기존 방식: 전체 데이터셋을 로드 후 랜덤 분할
+        print("\n[1단계] 원본 데이터 매칭 중...")
+        full_dataset_raw = ImageDataset(args.noisy_dir, args.clean_dir, 
+                                        matched_pairs_file=args.matched_pairs_file,
+                                        auto_match=args.auto_match,
+                                        transform=None)  # 증강 없이 먼저 확인
+        
+        total_raw_size = len(full_dataset_raw)
+        train_size = int(total_raw_size * args.train_ratio)
+        val_size = int(total_raw_size * args.val_ratio)
+        test_size = total_raw_size - train_size - val_size
+        
+        print(f"\n📊 원본 데이터 통계 (증강 전):")
+        print(f"   Total: {total_raw_size:,}개 쌍")
+        print(f"   분할 비율: Train={args.train_ratio:.1%}, Val={args.val_ratio:.1%}, Test={args.test_ratio:.1%}")
+        print(f"   예상 분할: Train={train_size:,}, Val={val_size:,}, Test={test_size:,}")
+        
+        # [2단계] 증강 적용된 데이터셋 생성
+        print("\n[2단계] 데이터 증강 적용 중...")
+        full_dataset = ImageDataset(args.noisy_dir, args.clean_dir, 
+                                    matched_pairs_file=args.matched_pairs_file,
+                                    auto_match=args.auto_match,
+                                    transform=train_transform)  # 데이터 증강 추가
+        
+        # Train/Validation 분할 (test는 inference에서 사용)
+        total_size = len(full_dataset)
+        train_dataset, val_dataset, _ = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size, test_size]
+        )
+        
+        train_final_count = len(train_dataset)
+        val_final_count = len(val_dataset)
+        train_effective_count = int(train_final_count * augmentation_factor)
+        
+        print(f"\n📊 최종 데이터 통계 (증강 적용 후):")
+        print(f"   Train:")
+        print(f"     - 실제 데이터량: {train_final_count:,}개 쌍")
+        print(f"     - 효과적 데이터량: ~{train_effective_count:,}개 쌍 (증강 ×{augmentation_factor:.1f})")
+        print(f"   Val:")
+        print(f"     - 실제 데이터량: {val_final_count:,}개 쌍 (증강 없음)")
+        print(f"   Total: {train_final_count + val_final_count:,}개 쌍")
+        print(f"   분할 비율: Train={train_final_count/total_size:.2%}, Val={val_final_count/total_size:.2%}, Test={test_size/total_size:.2%} (inference에서 사용)")
+        print(f"\n💡 참고: Train 데이터는 매 epoch마다 랜덤하게 변형되어")
+        print(f"   효과적으로 {train_effective_count:,}개의 서로 다른 이미지를 학습합니다.")
+        print('ℹ️  Test 데이터는 inference 코드에서 평가하세요.')
+    
+    # DataLoader 생성
+    # Windows 호환성을 위해 num_workers=0 사용
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True,
+        num_workers=0,  # Windows 호환성
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False,
+        num_workers=0,  # Windows 호환성
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    
+    # 모델 생성
+    model = UNet(in_channels=3, out_channels=3)
+    print(f'모델 파라미터 수: {sum(p.numel() for p in model.parameters()):,}')
+    
+    # 체크포인트에서 재개
+    start_epoch = 0
+    if args.resume:
+        print(f'\n체크포인트에서 학습 재개: {args.resume}')
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        print(f'✅ 체크포인트 로드 완료!')
+        print(f'   - Epoch: {checkpoint.get("epoch", 0)}')
+        print(f'   - Val Loss: {checkpoint.get("val_loss", "N/A"):.4f}')
+        print(f'   - Val PSNR: {checkpoint.get("val_psnr", "N/A"):.4f}')
+        print(f'   - Val SSIM: {checkpoint.get("val_ssim", "N/A"):.4f}')
+        print(f'   - 다음 Epoch부터 재개: {start_epoch}')
+    
+    # 학습
+    print('\n학습 시작...')
+    history = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=args.epochs,
+        device=device,
+        lr=args.lr,
+        checkpoint_dir=args.checkpoint_dir,
+        start_epoch=start_epoch,
+        resume_checkpoint=args.resume,
+        l1_weight=args.l1_weight,
+        ssim_weight=args.ssim_weight,
+        gradient_weight=args.gradient_weight
+    )
+    
+    # 최종 평가
+    print('\n최종 평가 중...')
+    best_model = UNet(in_channels=3, out_channels=3)
+    checkpoint = torch.load(f'{args.checkpoint_dir}/best_model.pth', map_location=device, weights_only=False)
+    best_model.load_state_dict(checkpoint['model_state_dict'])
+    best_model.to(device)
+    
+    print('\n=== Validation Set 평가 ===')
+    evaluate_model(best_model, val_loader, device=device)
+    
+    print('\n✅ 학습 완료!')
+    print('ℹ️  Test 데이터 평가는 inference 코드를 사용하세요:')
+    print(f'   python inference_unet.py --model_path {args.checkpoint_dir}/best_model.pth --noisy_dir {args.noisy_dir} --clean_dir {args.clean_dir if args.clean_dir else ""} --visualize')
+
+
+if __name__ == '__main__':
+    main()
+
