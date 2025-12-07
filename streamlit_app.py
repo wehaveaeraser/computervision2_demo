@@ -64,9 +64,6 @@ st.markdown('<p class="main-header">✨ 이미지 노이즈 제거</p>', unsafe_
 st.markdown('<p class="sub-header">딥러닝 모델을 사용한 실시간 노이즈 제거 시연</p>', unsafe_allow_html=True)
 st.markdown("---")
 
-# 사이드바: 모델 설정
-st.sidebar.header("⚙️ 모델 설정")
-
 # 모델 경로 설정 (lastcheckpoints 사용)
 # team/lastcheckpoints 폴더에 있는 모델 사용
 team_dir = Path(__file__).parent
@@ -77,40 +74,12 @@ unet_model_path = lastcheckpoints_dir / "unet" / "best_model.pth"
 cnn_exists = cnn_model_path.exists()
 unet_exists = unet_model_path.exists()
 
-# 모델 상태 표시 (자동으로 준비됨 - 사용자에게는 보이지 않게)
-if cnn_exists:
-    cnn_size = Path(cnn_model_path).stat().st_size / (1024 * 1024)  # MB
-    st.sidebar.success(f"✅ CNN 모델 준비됨 ({cnn_size:.1f} MB)")
-else:
-    # 모델이 없으면 자동으로 Hugging Face에서 가져오기 시도 (조용히)
-    st.sidebar.info("⏳ CNN 모델 준비 중...")
-
-if unet_exists:
-    unet_size = Path(unet_model_path).stat().st_size / (1024 * 1024)  # MB
-    st.sidebar.success(f"✅ U-Net 모델 준비됨 ({unet_size:.1f} MB)")
-else:
-    # 모델이 없으면 자동으로 Hugging Face에서 가져오기 시도 (조용히)
-    st.sidebar.info("⏳ U-Net 모델 준비 중...")
+# 모델 정보는 표시하지 않음 (사용자에게 보이지 않게)
 
 models_ready = cnn_exists and unet_exists
 
-# 디바이스 선택
-device_option = st.sidebar.selectbox(
-    "디바이스",
-    ["cuda", "cpu"],
-    index=0 if torch.cuda.is_available() else 1,
-    help="GPU가 있으면 cuda를 선택하세요"
-)
-
-device = torch.device(device_option if torch.cuda.is_available() and device_option == "cuda" else "cpu")
-
-# GPU 정보 표시
-if device.type == "cuda":
-    st.sidebar.success(f"✅ GPU 사용\n{torch.cuda.get_device_name(0)}")
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    st.sidebar.info(f"GPU 메모리: {gpu_memory:.1f} GB")
-else:
-    st.sidebar.info("ℹ️ CPU 모드로 실행 중")
+# 디바이스 선택 (사이드바에 표시하지 않음, 자동으로 설정)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 모델 로드 함수 (캐싱)
 @st.cache_resource
@@ -255,8 +224,6 @@ if uploaded_file is not None:
                 with col2:
                     st.image(cnn_result, caption="CNN 결과", use_container_width=True)
                     st.metric("처리 시간", f"{cnn_time*1000:.1f} ms")
-                    if cnn_info['val_psnr'] != 'N/A':
-                        st.caption(f"Val PSNR: {cnn_info['val_psnr']:.2f} dB")
                     
                     # CNN 다운로드
                     cnn_pil = Image.fromarray((cnn_result * 255).astype(np.uint8))
@@ -274,8 +241,6 @@ if uploaded_file is not None:
                 with col3:
                     st.image(unet_result, caption="U-Net 결과", use_container_width=True)
                     st.metric("처리 시간", f"{unet_time*1000:.1f} ms")
-                    if unet_info['val_psnr'] != 'N/A':
-                        st.caption(f"Val PSNR: {unet_info['val_psnr']:.2f} dB")
                     
                     # U-Net 다운로드
                     unet_pil = Image.fromarray((unet_result * 255).astype(np.uint8))
@@ -290,28 +255,7 @@ if uploaded_file is not None:
                         key="unet_download"
                     )
                 
-                # 모델 정보 표시
-                with st.expander("📊 모델 정보", expanded=True):
-                    col_info1, col_info2 = st.columns(2)
-                    with col_info1:
-                        st.markdown("### CNN 모델")
-                        st.metric("Epoch", cnn_info['epoch'])
-                        if cnn_info['val_loss'] != 'N/A':
-                            st.metric("Val Loss", f"{cnn_info['val_loss']:.4f}")
-                        if cnn_info['val_psnr'] != 'N/A':
-                            st.metric("Val PSNR", f"{cnn_info['val_psnr']:.2f} dB")
-                        if cnn_info['val_ssim'] != 'N/A':
-                            st.metric("Val SSIM", f"{cnn_info['val_ssim']:.4f}")
-                    
-                    with col_info2:
-                        st.markdown("### U-Net 모델")
-                        st.metric("Epoch", unet_info['epoch'])
-                        if unet_info['val_loss'] != 'N/A':
-                            st.metric("Val Loss", f"{unet_info['val_loss']:.4f}")
-                        if unet_info['val_psnr'] != 'N/A':
-                            st.metric("Val PSNR", f"{unet_info['val_psnr']:.2f} dB")
-                        if unet_info['val_ssim'] != 'N/A':
-                            st.metric("Val SSIM", f"{unet_info['val_ssim']:.4f}")
+                # 모델 정보는 표시하지 않음
                 
                 # 세션 상태에 결과 저장
                 st.session_state['cnn_result'] = cnn_result
